@@ -288,10 +288,17 @@
               <option value="despesa">Despesas</option>
             </select>
             <select id="filterCategory"><option value="">Todas as categorias</option></select>
+            <select id="filterPayment">
+              <option value="">Todas as formas</option>
+              <option value="Dinheiro">Dinheiro</option>
+              <option value="Pix">Pix</option>
+              <option value="Débito">Débito</option>
+              <option value="Crédito">Cartão de crédito</option>
+            </select>
           </div>
           <div style="overflow-x:auto;">
             <table>
-              <thead><tr><th>Data</th><th>Categoria</th><th>Descrição</th><th>Quem</th><th style="text-align:right;">Valor</th><th></th></tr></thead>
+              <thead><tr><th>Data</th><th>Categoria</th><th>Descrição</th><th>Pagamento</th><th>Quem</th><th style="text-align:right;">Valor</th><th></th></tr></thead>
               <tbody id="txTableBody"></tbody>
             </table>
             <div id="txEmpty" class="empty" style="display:none;">Nenhum lançamento ainda. Adicione o primeiro ao lado →</div>
@@ -310,6 +317,21 @@
           </div>
           <div class="field"><label for="txCategory">Categoria</label><select id="txCategory"></select></div>
           <div class="field"><label for="txDesc">Descrição</label><input type="text" id="txDesc" placeholder="Ex: Supermercado do mês"></div>
+          <div class="form-row" id="paymentRow">
+            <div class="field"><label for="txPayment">Forma de pagamento</label>
+              <select id="txPayment">
+                <option value="Dinheiro">Dinheiro</option>
+                <option value="Pix">Pix</option>
+                <option value="Débito">Débito</option>
+                <option value="Crédito">Cartão de crédito</option>
+              </select>
+            </div>
+            <div class="field" id="installmentsField" style="display:none;">
+              <label for="txInstallments">Nº de parcelas</label>
+              <input type="number" id="txInstallments" min="1" max="48" value="1">
+            </div>
+          </div>
+          <p class="muted" id="installmentsHint" style="display:none; margin-top:-8px;"></p>
           <div class="field"><label for="txMember">Quem</label>
             <select id="txMember"><option>Casal</option><option id="memberOptA">Você</option><option id="memberOptB">Parceiro(a)</option></select>
           </div>
@@ -522,6 +544,41 @@ document.querySelectorAll('input[name=txType]').forEach(r=>{
 populateCategorySelect(document.getElementById('txCategory'), 'receita');
 document.getElementById('txDate').valueAsDate = new Date();
 
+function toggleInstallmentsVisibility(){
+  const type = document.querySelector('input[name=txType]:checked').value;
+  const payment = document.getElementById('txPayment').value;
+  const show = (type === 'despesa' && payment === 'Crédito');
+  document.getElementById('installmentsField').style.display = show ? 'block' : 'none';
+  document.getElementById('installmentsHint').style.display = show ? 'block' : 'none';
+  if(!show) document.getElementById('txInstallments').value = 1;
+  updateInstallmentsHint();
+}
+function updateInstallmentsHint(){
+  const n = parseInt(document.getElementById('txInstallments').value) || 1;
+  const total = parseFloat(document.getElementById('txAmount').value) || 0;
+  const hint = document.getElementById('installmentsHint');
+  if(n > 1 && total > 0){
+    hint.textContent = `${n}x de ${fmtBRL(total/n)} — uma parcela lançada em cada um dos próximos ${n} meses.`;
+  } else {
+    hint.textContent = '';
+  }
+}
+document.querySelectorAll('input[name=txType]').forEach(r=> r.addEventListener('change', toggleInstallmentsVisibility));
+document.getElementById('txPayment').addEventListener('change', toggleInstallmentsVisibility);
+document.getElementById('txInstallments').addEventListener('input', updateInstallmentsHint);
+document.getElementById('txAmount').addEventListener('input', updateInstallmentsHint);
+
+function addMonths(dateStr, n){
+  const [y,m,d] = dateStr.split('-').map(Number);
+  const dt = new Date(y, m-1, d);
+  dt.setMonth(dt.getMonth()+n);
+  // se o dia não existir no mês de destino (ex: 31 em mês de 30), JS já rola pro mês seguinte;
+  // para evitar isso, comparamos e voltamos pro último dia do mês pretendido.
+  if(dt.getDate() !== d){ dt.setDate(0); }
+  const yy = dt.getFullYear(), mm = String(dt.getMonth()+1).padStart(2,'0'), dd = String(dt.getDate()).padStart(2,'0');
+  return `${yy}-${mm}-${dd}`;
+}
+
 document.getElementById('addTxBtn').addEventListener('click', async ()=>{
   const type = document.querySelector('input[name=txType]:checked').value;
   const date = document.getElementById('txDate').value;
@@ -529,12 +586,32 @@ document.getElementById('addTxBtn').addEventListener('click', async ()=>{
   const category = document.getElementById('txCategory').value;
   const desc = document.getElementById('txDesc').value.trim();
   const member = document.getElementById('txMember').value;
+  const payment = document.getElementById('txPayment').value;
+  const installmentsTotal = (type==='despesa' && payment==='Crédito') ? Math.max(1, parseInt(document.getElementById('txInstallments').value) || 1) : 1;
+
   if(!date || !amount || amount<=0){ showToast('Preencha data e um valor válido.'); return; }
-  state.transactions.push({id:uid(), type, date, amount, category, desc, member});
+
+  if(installmentsTotal > 1){
+    const groupId = uid();
+    const base = Math.floor((amount/installmentsTotal)*100)/100;
+    const rounding = Math.round((amount - base*installmentsTotal)*100)/100; // sobra vai na última parcela
+    for(let i=0;i<installmentsTotal;i++){
+      const parcelaValor = (i === installmentsTotal-1) ? Math.round((base+rounding)*100)/100 : base;
+      state.transactions.push({
+        id: uid(), type, date: addMonths(date, i), amount: parcelaValor, category, desc, member,
+        payment, installments: {cur: i+1, total: installmentsTotal}, groupId
+      });
+    }
+    showToast(`${installmentsTotal} parcelas lançadas.`);
+  } else {
+    state.transactions.push({id:uid(), type, date, amount, category, desc, member, payment, installments:null, groupId:null});
+    showToast('Lançamento adicionado.');
+  }
+
   state.transactions.sort((a,b)=> b.date.localeCompare(a.date));
   await saveTransactions();
   document.getElementById('txAmount').value=''; document.getElementById('txDesc').value='';
-  showToast('Lançamento adicionado.');
+  document.getElementById('txInstallments').value = 1; updateInstallmentsHint();
   populateFilters(); renderTxTable();
 });
 
@@ -554,28 +631,35 @@ function populateFilters(){
   fc.innerHTML = '<option value="">Todas as categorias</option>' + allCats.map(c=>`<option value="${c}">${c}</option>`).join('');
   if(allCats.includes(curC)) fc.value = curC;
 }
-['filterMonth','filterType','filterCategory'].forEach(id=>{
+['filterMonth','filterType','filterCategory','filterPayment'].forEach(id=>{
   document.getElementById(id).addEventListener('change', renderTxTable);
 });
+
+const PAYMENT_ICON = {'Dinheiro':'💵','Pix':'⚡','Débito':'💳','Crédito':'💳'};
 
 function renderTxTable(){
   const fm = document.getElementById('filterMonth').value;
   const ftype = document.getElementById('filterType').value;
   const fcat = document.getElementById('filterCategory').value;
+  const fpay = document.getElementById('filterPayment').value;
   let rows = state.transactions.filter(t=>{
     if(fm && !t.date.startsWith(fm)) return false;
     if(ftype && t.type !== ftype) return false;
     if(fcat && t.category !== fcat) return false;
+    if(fpay && t.payment !== fpay) return false;
     return true;
   });
   const body = document.getElementById('txTableBody');
   document.getElementById('txEmpty').style.display = rows.length ? 'none' : 'block';
   body.innerHTML = rows.map(t=>{
     const [y,m,d] = t.date.split('-');
+    const payLabel = t.payment ? `${PAYMENT_ICON[t.payment]||''} ${t.payment}` : '<span class="muted">—</span>';
+    const parcelaTag = t.installments ? ` <span class="pill" style="background:var(--mustard-soft); color:#7A5C10;">${t.installments.cur}/${t.installments.total}</span>` : '';
     return `<tr>
       <td>${d}/${m}</td>
       <td><span class="pill">${t.category}</span></td>
-      <td>${t.desc || '<span class="muted">—</span>'}</td>
+      <td>${t.desc || '<span class="muted">—</span>'}${parcelaTag}</td>
+      <td>${payLabel}</td>
       <td>${t.member}</td>
       <td class="amt ${t.type}">${t.type==='despesa'?'-':'+'} ${fmtBRL(t.amount)}</td>
       <td><button class="row-del" data-id="${t.id}" title="Remover">✕</button></td>
@@ -583,7 +667,16 @@ function renderTxTable(){
   }).join('');
   body.querySelectorAll('.row-del').forEach(b=>{
     b.addEventListener('click', async ()=>{
-      state.transactions = state.transactions.filter(t=>t.id !== b.dataset.id);
+      const tx = state.transactions.find(t=>t.id === b.dataset.id);
+      if(tx && tx.groupId){
+        const restante = state.transactions.filter(t=>t.groupId===tx.groupId).length - 1;
+        const apagarTudo = restante > 0 && confirm(`Esta é uma parcela (${tx.installments.cur}/${tx.installments.total}). Quer apagar só esta parcela ou todas as ${tx.installments.total} do parcelamento?\n\nOK = apagar todas · Cancelar = apagar só esta`);
+        state.transactions = apagarTudo
+          ? state.transactions.filter(t=>t.groupId !== tx.groupId)
+          : state.transactions.filter(t=>t.id !== tx.id);
+      } else {
+        state.transactions = state.transactions.filter(t=>t.id !== b.dataset.id);
+      }
       await saveTransactions();
       populateFilters(); renderTxTable(); renderResumo(); renderOrcamento();
     });
@@ -874,6 +967,7 @@ document.getElementById('addSave').addEventListener('click', async ()=>{
   renderResumo();
   document.getElementById('memberOptA').textContent = 'Você';
   document.getElementById('memberOptB').textContent = 'Parceiro(a)';
+  toggleInstallmentsVisibility();
 })();
 </script>
 </body>
