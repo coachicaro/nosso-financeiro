@@ -530,7 +530,14 @@ function fmtBRL(n){
   return (n<0?"-":"") + "R$ " + Math.abs(n).toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});
 }
 function monthKey(d){ return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,'0'); }
-function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+function uid(){
+  if(typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  // fallback simples no formato UUID v4, para navegadores sem crypto.randomUUID
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c=>{
+    const r = Math.random()*16|0, v = c==='x' ? r : (r&0x3|0x8);
+    return v.toString(16);
+  });
+}
 function showToast(msg){
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
