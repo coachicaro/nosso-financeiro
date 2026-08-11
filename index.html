@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root{
     --ink:#1B2E2C;
@@ -263,7 +264,13 @@
       <button class="tab-btn" data-tab="simulacao"><span class="dot"></span>Simulação</button>
       <button class="tab-btn" data-tab="metas"><span class="dot"></span>Metas</button>
     </nav>
-    <div class="rail-footer">Seus dados ficam salvos<br>neste navegador, só entre vocês dois.</div>
+    <div class="rail-divider"></div>
+    <div style="display:flex; flex-direction:column; gap:6px;">
+      <button class="tab-btn" id="exportBtn"><span class="dot"></span>Baixar backup</button>
+      <button class="tab-btn" id="importBtn"><span class="dot"></span>Importar backup</button>
+      <input type="file" id="importFile" accept="application/json" style="display:none;">
+    </div>
+    <div class="rail-footer">Dados sincronizados no Supabase.<br>Acessível de qualquer aparelho<br>com este mesmo link/arquivo.</div>
   </aside>
 
   <main class="main">
@@ -461,6 +468,14 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="confirmModal">
+  <div class="modal">
+    <h3 class="serif" id="confirmTitle">Confirmar</h3>
+    <p class="muted" id="confirmMessage" style="margin-top:-6px;"></p>
+    <div class="modal-actions" id="confirmActions"></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -473,9 +488,43 @@ const CATEGORIES = {
 };
 const MONTH_NAMES = ["janeiro","fevereiro","março","abril","maio","junho","julho","agosto","setembro","outubro","novembro","dezembro"];
 
+function describeError(err){
+  if(!err) return 'Erro desconhecido';
+  if(typeof err === 'string') return err;
+  if(err.message) return err.message + (err.details ? ' — '+err.details : '') + (err.hint ? ' ('+err.hint+')' : '');
+  try{ return JSON.stringify(err); }catch(e){ return String(err); }
+}
+window.addEventListener('error', (e)=>{
+  console.error('Erro capturado:', e.error || e.message, e);
+});
+window.addEventListener('unhandledrejection', (e)=>{
+  console.error('Promise rejeitada:', describeError(e.reason), e.reason);
+  showToast('Erro: ' + describeError(e.reason));
+});
+
 let state = { transactions: [], goals: [], budgets: {} };
 let currentMonth = new Date(); currentMonth.setDate(1);
 let charts = {};
+let dbReady = false;
+
+const SUPABASE_URL = 'https://cbwupjmzhtjqadrcttfs.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_pLlUPjiBkY9w7fOyMi733Q_sexGCVFK';
+let sb = null;
+if(typeof window.supabase !== 'undefined' && window.supabase.createClient){
+  sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+} else {
+  console.error('Biblioteca do Supabase não carregou.');
+}
+
+function rowToTx(r){
+  return {
+    id: r.id, type: r.tipo, date: r.data, amount: Number(r.valor), category: r.categoria,
+    desc: r.descricao || '', member: r.membro || 'Casal', payment: r.forma_pagamento || '',
+    installments: (r.parcela_total ? {cur:r.parcela_atual, total:r.parcela_total} : null),
+    groupId: r.grupo_id
+  };
+}
+function rowToGoal(r){ return { id:r.id, name:r.nome, target:Number(r.alvo), current:Number(r.atual) }; }
 
 function fmtBRL(n){
   return (n<0?"-":"") + "R$ " + Math.abs(n).toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -486,34 +535,129 @@ function showToast(msg){
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
   clearTimeout(showToast._h);
-  showToast._h = setTimeout(()=>t.classList.remove('show'), 2200);
+  showToast._h = setTimeout(()=>t.classList.remove('show'), 2600);
 }
 
 async function loadState(){
+  if(!sb){
+    showToast('⚠️ Não consegui carregar a biblioteca do Supabase. Recarregue a página.');
+    return;
+  }
   try{
-    const tx = await window.storage.get('transactions', false);
-    state.transactions = tx ? JSON.parse(tx.value) : [];
-  }catch(e){ state.transactions = []; }
+    const [txRes, goalRes, budgetRes] = await Promise.all([
+      sb.from('family_transactions').select('*').order('data', {ascending:false}),
+      sb.from('family_goals').select('*').order('criado_em', {ascending:true}),
+      sb.from('family_budgets').select('*')
+    ]);
+    if(txRes.error || goalRes.error || budgetRes.error){
+      const err = txRes.error || goalRes.error || budgetRes.error;
+      dbReady = false;
+      showToast('⚠️ Não consegui conectar ao Supabase: ' + describeError(err));
+      console.error(err);
+      return;
+    }
+    dbReady = true;
+    state.transactions = (txRes.data || []).map(rowToTx);
+    state.goals = (goalRes.data || []).map(rowToGoal);
+    state.budgets = {};
+    (budgetRes.data || []).forEach(b => state.budgets[b.categoria] = Number(b.limite));
+  }catch(err){
+    dbReady = false;
+    showToast('⚠️ Erro de conexão com o Supabase: ' + describeError(err));
+    console.error(err);
+  }
+}
+
+/* -------- transações -------- */
+async function dbInsertTransactions(rows){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return []; }
+  const { data, error } = await sb.from('family_transactions').insert(rows).select();
+  if(error){ showToast('Não consegui salvar no Supabase: ' + describeError(error)); console.error(error); return []; }
+  return (data || []).map(rowToTx);
+}
+async function dbDeleteTransaction(id){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return false; }
+  const { error } = await sb.from('family_transactions').delete().eq('id', id);
+  if(error){ showToast('Não consegui apagar no Supabase: ' + describeError(error)); console.error(error); return false; }
+  return true;
+}
+async function dbDeleteGroup(groupId){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return false; }
+  const { error } = await sb.from('family_transactions').delete().eq('grupo_id', groupId);
+  if(error){ showToast('Não consegui apagar as parcelas: ' + describeError(error)); console.error(error); return false; }
+  return true;
+}
+
+/* -------- orçamento -------- */
+async function dbUpsertBudget(categoria, limite){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return; }
+  const { error } = await sb.from('family_budgets').upsert({categoria, limite, atualizado_em:new Date().toISOString()});
+  if(error){ showToast('Não consegui salvar o orçamento: ' + describeError(error)); console.error(error); }
+}
+async function dbDeleteBudget(categoria){
+  if(!sb) return;
+  const { error } = await sb.from('family_budgets').delete().eq('categoria', categoria);
+  if(error){ console.error(error); }
+}
+
+/* -------- metas -------- */
+async function dbInsertGoal(nome, alvo, atual){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return null; }
+  const { data, error } = await sb.from('family_goals').insert({nome, alvo, atual}).select().single();
+  if(error){ showToast('Não consegui criar a meta: ' + describeError(error)); console.error(error); return null; }
+  return rowToGoal(data);
+}
+async function dbUpdateGoalAmount(id, atual){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return; }
+  const { error } = await sb.from('family_goals').update({atual}).eq('id', id);
+  if(error){ showToast('Não consegui atualizar a meta: ' + describeError(error)); console.error(error); }
+}
+async function dbDeleteGoal(id){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return; }
+  const { error } = await sb.from('family_goals').delete().eq('id', id);
+  if(error){ showToast('Não consegui excluir a meta: ' + describeError(error)); console.error(error); }
+}
+
+/* -------- backup manual (extra, opcional) -------- */
+function exportBackup(){
+  const payload = { transactions: state.transactions, goals: state.goals, budgets: state.budgets, exportedAt: new Date().toISOString() };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `backup-livro-caixa-${new Date().toISOString().slice(0,10)}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  showToast('Backup baixado.');
+}
+async function importBackup(file){
   try{
-    const g = await window.storage.get('goals', false);
-    state.goals = g ? JSON.parse(g.value) : [];
-  }catch(e){ state.goals = []; }
-  try{
-    const b = await window.storage.get('budgets', false);
-    state.budgets = b ? JSON.parse(b.value) : {};
-  }catch(e){ state.budgets = {}; }
-}
-async function saveTransactions(){
-  try{ await window.storage.set('transactions', JSON.stringify(state.transactions), false); }
-  catch(e){ showToast('Não foi possível salvar. Tente novamente.'); }
-}
-async function saveGoals(){
-  try{ await window.storage.set('goals', JSON.stringify(state.goals), false); }
-  catch(e){ showToast('Não foi possível salvar. Tente novamente.'); }
-}
-async function saveBudgets(){
-  try{ await window.storage.set('budgets', JSON.stringify(state.budgets), false); }
-  catch(e){ showToast('Não foi possível salvar. Tente novamente.'); }
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if(!Array.isArray(data.transactions)) throw new Error('formato inválido');
+    if(data.transactions.length){
+      const escolha = await showChoice(
+        'Importar backup',
+        `Isso vai importar ${data.transactions.length} lançamentos para o banco de dados compartilhado. Continuar?`,
+        [{label:'Cancelar', value:'cancel', variant:'ghost'}, {label:'Importar', value:'ok'}]
+      );
+      if(escolha !== 'ok') return;
+    }
+    for(const t of data.transactions){
+      await sb.from('family_transactions').insert({
+        tipo:t.type, data:t.date, valor:t.amount, categoria:t.category, descricao:t.desc, membro:t.member,
+        forma_pagamento:t.payment, parcela_atual: t.installments?.cur || null, parcela_total: t.installments?.total || null,
+        grupo_id: t.groupId || null
+      });
+    }
+    for(const g of (data.goals||[])){ await dbInsertGoal(g.name, g.target, g.current); }
+    for(const cat in (data.budgets||{})){ await dbUpsertBudget(cat, data.budgets[cat]); }
+    await loadState();
+    populateFilters(); renderTxTable(); renderResumo(); renderOrcamento(); renderMetas();
+    showToast('Backup importado com sucesso.');
+  }catch(e){
+    showToast('Não consegui ler esse arquivo de backup.');
+    console.error(e);
+  }
 }
 
 /* ---------------------------------------------------------------
@@ -591,28 +735,35 @@ document.getElementById('addTxBtn').addEventListener('click', async ()=>{
 
   if(!date || !amount || amount<=0){ showToast('Preencha data e um valor válido.'); return; }
 
+  const btn = document.getElementById('addTxBtn');
+  btn.textContent = 'Salvando...'; btn.style.opacity = '.7';
+
+  let rows = [];
   if(installmentsTotal > 1){
     const groupId = uid();
     const base = Math.floor((amount/installmentsTotal)*100)/100;
     const rounding = Math.round((amount - base*installmentsTotal)*100)/100; // sobra vai na última parcela
     for(let i=0;i<installmentsTotal;i++){
       const parcelaValor = (i === installmentsTotal-1) ? Math.round((base+rounding)*100)/100 : base;
-      state.transactions.push({
-        id: uid(), type, date: addMonths(date, i), amount: parcelaValor, category, desc, member,
-        payment, installments: {cur: i+1, total: installmentsTotal}, groupId
+      rows.push({
+        tipo:type, data: addMonths(date, i), valor: parcelaValor, categoria:category, descricao:desc, membro:member,
+        forma_pagamento: payment, parcela_atual: i+1, parcela_total: installmentsTotal, grupo_id: groupId
       });
     }
-    showToast(`${installmentsTotal} parcelas lançadas.`);
   } else {
-    state.transactions.push({id:uid(), type, date, amount, category, desc, member, payment, installments:null, groupId:null});
-    showToast('Lançamento adicionado.');
+    rows.push({tipo:type, data:date, valor:amount, categoria:category, descricao:desc, membro:member, forma_pagamento:payment, parcela_atual:null, parcela_total:null, grupo_id:null});
   }
 
-  state.transactions.sort((a,b)=> b.date.localeCompare(a.date));
-  await saveTransactions();
-  document.getElementById('txAmount').value=''; document.getElementById('txDesc').value='';
-  document.getElementById('txInstallments').value = 1; updateInstallmentsHint();
-  populateFilters(); renderTxTable();
+  const inserted = await dbInsertTransactions(rows);
+  btn.textContent = 'Adicionar lançamento'; btn.style.opacity = '1';
+  if(inserted.length){
+    state.transactions.push(...inserted);
+    state.transactions.sort((a,b)=> b.date.localeCompare(a.date));
+    showToast(installmentsTotal>1 ? `${installmentsTotal} parcelas lançadas.` : 'Lançamento adicionado.');
+    document.getElementById('txAmount').value=''; document.getElementById('txDesc').value='';
+    document.getElementById('txInstallments').value = 1; updateInstallmentsHint();
+    populateFilters(); renderTxTable(); renderResumo(); renderOrcamento();
+  }
 });
 
 function populateFilters(){
@@ -668,17 +819,33 @@ function renderTxTable(){
   body.querySelectorAll('.row-del').forEach(b=>{
     b.addEventListener('click', async ()=>{
       const tx = state.transactions.find(t=>t.id === b.dataset.id);
-      if(tx && tx.groupId){
+      if(!tx) return;
+      let ok;
+      if(tx.groupId){
         const restante = state.transactions.filter(t=>t.groupId===tx.groupId).length - 1;
-        const apagarTudo = restante > 0 && confirm(`Esta é uma parcela (${tx.installments.cur}/${tx.installments.total}). Quer apagar só esta parcela ou todas as ${tx.installments.total} do parcelamento?\n\nOK = apagar todas · Cancelar = apagar só esta`);
-        state.transactions = apagarTudo
+        let apagarTudo = false;
+        if(restante > 0){
+          const escolha = await showChoice(
+            'Apagar parcela',
+            `Esta é a parcela ${tx.installments.cur}/${tx.installments.total}. Apagar só esta ou todas as ${tx.installments.total}?`,
+            [
+              {label:'Cancelar', value:'cancel', variant:'ghost'},
+              {label:'Só esta', value:'one'},
+              {label:`Todas (${tx.installments.total})`, value:'all', variant:'danger'}
+            ]
+          );
+          if(escolha === 'cancel' || !escolha) return;
+          apagarTudo = escolha === 'all';
+        }
+        ok = apagarTudo ? await dbDeleteGroup(tx.groupId) : await dbDeleteTransaction(tx.id);
+        if(ok) state.transactions = apagarTudo
           ? state.transactions.filter(t=>t.groupId !== tx.groupId)
           : state.transactions.filter(t=>t.id !== tx.id);
       } else {
-        state.transactions = state.transactions.filter(t=>t.id !== b.dataset.id);
+        ok = await dbDeleteTransaction(tx.id);
+        if(ok) state.transactions = state.transactions.filter(t=>t.id !== tx.id);
       }
-      await saveTransactions();
-      populateFilters(); renderTxTable(); renderResumo(); renderOrcamento();
+      if(ok){ populateFilters(); renderTxTable(); renderResumo(); renderOrcamento(); }
     });
   });
 }
@@ -794,9 +961,13 @@ function renderOrcamento(){
   container.querySelectorAll('.budget-edit').forEach(inp=>{
     inp.addEventListener('change', async ()=>{
       const v = parseFloat(inp.value);
-      if(!isNaN(v) && v>=0) state.budgets[inp.dataset.cat] = v;
-      else delete state.budgets[inp.dataset.cat];
-      await saveBudgets();
+      if(!isNaN(v) && v>=0){
+        state.budgets[inp.dataset.cat] = v;
+        await dbUpsertBudget(inp.dataset.cat, v);
+      } else {
+        delete state.budgets[inp.dataset.cat];
+        await dbDeleteBudget(inp.dataset.cat);
+      }
       renderOrcamento();
     });
   });
@@ -925,13 +1096,36 @@ function renderMetas(){
   });
   grid.querySelectorAll('[data-del]').forEach(b=>{
     b.addEventListener('click', async ()=>{
+      await dbDeleteGoal(b.dataset.del);
       state.goals = state.goals.filter(g=>g.id!==b.dataset.del);
-      await saveGoals(); renderMetas();
+      renderMetas();
     });
   });
 }
 function openModal(id){ document.getElementById(id).classList.add('show'); }
 function closeModal(id){ document.getElementById(id).classList.remove('show'); }
+
+// Substitui window.confirm/alert, que ficam bloqueados dentro da prévia de artefatos.
+function showChoice(title, message, buttons){
+  // buttons: [{label, value, variant:'btn'|'ghost'|'danger'}]
+  return new Promise((resolve)=>{
+    document.getElementById('confirmTitle').textContent = title;
+    document.getElementById('confirmMessage').textContent = message;
+    const actions = document.getElementById('confirmActions');
+    actions.innerHTML = '';
+    buttons.forEach(b=>{
+      const btn = document.createElement('button');
+      btn.className = 'btn ' + (b.variant || '');
+      btn.textContent = b.label;
+      btn.addEventListener('click', ()=>{
+        closeModal('confirmModal');
+        resolve(b.value);
+      });
+      actions.appendChild(btn);
+    });
+    openModal('confirmModal');
+  });
+}
 
 document.getElementById('goalCancel').addEventListener('click', ()=>closeModal('goalModal'));
 document.getElementById('goalSave').addEventListener('click', async ()=>{
@@ -939,10 +1133,12 @@ document.getElementById('goalSave').addEventListener('click', async ()=>{
   const target = parseFloat(document.getElementById('goalTarget').value);
   const current = parseFloat(document.getElementById('goalCurrent').value) || 0;
   if(!name || !target || target<=0){ showToast('Dê um nome e um valor alvo válido.'); return; }
-  state.goals.push({id:uid(), name, target, current});
-  await saveGoals();
-  document.getElementById('goalName').value=''; document.getElementById('goalTarget').value=''; document.getElementById('goalCurrent').value='0';
-  closeModal('goalModal'); renderMetas(); showToast('Pote criado.');
+  const goal = await dbInsertGoal(name, target, current);
+  if(goal){
+    state.goals.push(goal);
+    document.getElementById('goalName').value=''; document.getElementById('goalTarget').value=''; document.getElementById('goalCurrent').value='0';
+    closeModal('goalModal'); renderMetas(); showToast('Pote criado.');
+  }
 });
 
 let addModalTargetId = null;
@@ -951,7 +1147,11 @@ document.getElementById('addSave').addEventListener('click', async ()=>{
   const v = parseFloat(document.getElementById('addAmount').value);
   if(!v || v<=0){ showToast('Informe um valor válido.'); return; }
   const goal = state.goals.find(g=>g.id===addModalTargetId);
-  if(goal){ goal.current += v; await saveGoals(); }
+  if(goal){
+    const novoValor = goal.current + v;
+    await dbUpdateGoalAmount(goal.id, novoValor);
+    goal.current = novoValor;
+  }
   document.getElementById('addAmount').value='';
   closeModal('addModal'); renderMetas(); showToast('Guardado no pote!');
 });
@@ -959,7 +1159,16 @@ document.getElementById('addSave').addEventListener('click', async ()=>{
 /* ---------------------------------------------------------------
    INIT
 ---------------------------------------------------------------- */
+document.getElementById('exportBtn').addEventListener('click', exportBackup);
+document.getElementById('importBtn').addEventListener('click', ()=> document.getElementById('importFile').click());
+document.getElementById('importFile').addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if(file) importBackup(file);
+  e.target.value = '';
+});
+
 (async function init(){
+  showToast('Carregando dados...');
   await loadState();
   populateFilters();
   renderTxTable();
@@ -968,6 +1177,7 @@ document.getElementById('addSave').addEventListener('click', async ()=>{
   document.getElementById('memberOptA').textContent = 'Você';
   document.getElementById('memberOptB').textContent = 'Parceiro(a)';
   toggleInstallmentsVisibility();
+  if(dbReady) showToast('Dados carregados do Supabase.');
 })();
 </script>
 </body>
