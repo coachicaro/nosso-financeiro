@@ -180,6 +180,17 @@
   .bar-fill.warn{background:var(--mustard);}
   .budget-edit{width:96px;}
 
+  .sub-row{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:10px 12px; border:1px solid var(--paper-line); border-radius:10px; margin-bottom:8px; background:#fff;
+  }
+  .sub-row.paused{opacity:.55;}
+  .sub-row .info{display:flex; flex-direction:column; gap:2px;}
+  .sub-row .info strong{font-size:14px;}
+  .sub-row .info span{font-size:12px; color:var(--ink-soft);}
+  .sub-row .actions{display:flex; gap:6px; align-items:center;}
+  .sub-empty{font-size:13px; color:var(--ink-soft); padding:6px 0 2px;}
+
   .slider-row{display:flex; align-items:center; gap:12px; margin-bottom:14px;}
   .slider-row .name{width:140px; font-size:13.5px; font-weight:600;}
   .slider-row input[type=range]{flex:1; accent-color:var(--teal);}
@@ -345,6 +356,25 @@
           <button class="btn" id="addTxBtn" style="width:100%; justify-content:center;">Adicionar lançamento</button>
         </div>
       </div>
+
+      <div class="panel" style="margin-top:20px;">
+        <div class="section-title">Assinaturas no cartão<span class="stitch"></span></div>
+        <p class="muted" style="margin-top:-6px;">Cadastre uma vez — o valor é lançado sozinho todo mês, até você cancelar.</p>
+        <div id="subsList" style="margin:16px 0;"></div>
+        <div class="divider"></div>
+        <div class="form-row">
+          <div class="field"><label for="subName">Serviço</label><input type="text" id="subName" placeholder="Ex: Netflix"></div>
+          <div class="field"><label for="subValue">Valor mensal (R$)</label><input type="number" id="subValue" step="0.01" min="0"></div>
+        </div>
+        <div class="form-row">
+          <div class="field"><label for="subCategory">Categoria</label><select id="subCategory"></select></div>
+          <div class="field"><label for="subDay">Dia da cobrança</label><input type="number" id="subDay" min="1" max="28" value="1"></div>
+        </div>
+        <div class="field"><label for="subMember">Quem</label>
+          <select id="subMember"><option>Casal</option><option id="subMemberOptA">Você</option><option id="subMemberOptB">Parceiro(a)</option></select>
+        </div>
+        <button class="btn ghost" id="addSubBtn" style="width:100%; justify-content:center;">+ Nova assinatura</button>
+      </div>
     </section>
 
     <!-- ===================== RESUMO ===================== -->
@@ -502,10 +532,14 @@ window.addEventListener('unhandledrejection', (e)=>{
   showToast('Erro: ' + describeError(e.reason));
 });
 
-let state = { transactions: [], goals: [], budgets: {} };
+let state = { transactions: [], goals: [], budgets: {}, subscriptions: [] };
 let currentMonth = new Date(); currentMonth.setDate(1);
 let charts = {};
 let dbReady = false;
+
+function rowToSub(r){
+  return { id:r.id, nome:r.nome, categoria:r.categoria, valor:Number(r.valor), diaCobranca:r.dia_cobranca, membro:r.membro || 'Casal', ativa:r.ativa, inicio:r.inicio };
+}
 
 const SUPABASE_URL = 'https://cbwupjmzhtjqadrcttfs.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_pLlUPjiBkY9w7fOyMi733Q_sexGCVFK';
@@ -521,7 +555,7 @@ function rowToTx(r){
     id: r.id, type: r.tipo, date: r.data, amount: Number(r.valor), category: r.categoria,
     desc: r.descricao || '', member: r.membro || 'Casal', payment: r.forma_pagamento || '',
     installments: (r.parcela_total ? {cur:r.parcela_atual, total:r.parcela_total} : null),
-    groupId: r.grupo_id
+    groupId: r.grupo_id, subscriptionId: r.subscricao_id || null
   };
 }
 function rowToGoal(r){ return { id:r.id, name:r.nome, target:Number(r.alvo), current:Number(r.atual) }; }
@@ -551,13 +585,14 @@ async function loadState(){
     return;
   }
   try{
-    const [txRes, goalRes, budgetRes] = await Promise.all([
+    const [txRes, goalRes, budgetRes, subRes] = await Promise.all([
       sb.from('family_transactions').select('*').order('data', {ascending:false}),
       sb.from('family_goals').select('*').order('criado_em', {ascending:true}),
-      sb.from('family_budgets').select('*')
+      sb.from('family_budgets').select('*'),
+      sb.from('family_subscriptions').select('*').order('criado_em', {ascending:true})
     ]);
-    if(txRes.error || goalRes.error || budgetRes.error){
-      const err = txRes.error || goalRes.error || budgetRes.error;
+    if(txRes.error || goalRes.error || budgetRes.error || subRes.error){
+      const err = txRes.error || goalRes.error || budgetRes.error || subRes.error;
       dbReady = false;
       showToast('⚠️ Não consegui conectar ao Supabase: ' + describeError(err));
       console.error(err);
@@ -566,6 +601,7 @@ async function loadState(){
     dbReady = true;
     state.transactions = (txRes.data || []).map(rowToTx);
     state.goals = (goalRes.data || []).map(rowToGoal);
+    state.subscriptions = (subRes.data || []).map(rowToSub);
     state.budgets = {};
     (budgetRes.data || []).forEach(b => state.budgets[b.categoria] = Number(b.limite));
   }catch(err){
@@ -625,7 +661,63 @@ async function dbDeleteGoal(id){
   if(error){ showToast('Não consegui excluir a meta: ' + describeError(error)); console.error(error); }
 }
 
-/* -------- backup manual (extra, opcional) -------- */
+/* -------- assinaturas -------- */
+async function dbInsertSubscription(nome, categoria, valor, diaCobranca, membro){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return null; }
+  const inicio = new Date(); inicio.setDate(1);
+  const inicioStr = inicio.toISOString().slice(0,10);
+  const { data, error } = await sb.from('family_subscriptions')
+    .insert({nome, categoria, valor, dia_cobranca:diaCobranca, membro, ativa:true, inicio:inicioStr})
+    .select().single();
+  if(error){ showToast('Não consegui criar a assinatura: ' + describeError(error)); console.error(error); return null; }
+  return rowToSub(data);
+}
+async function dbSetSubscriptionActive(id, ativa){
+  if(!sb) return;
+  const { error } = await sb.from('family_subscriptions').update({ativa}).eq('id', id);
+  if(error){ showToast('Não consegui atualizar a assinatura: ' + describeError(error)); console.error(error); }
+}
+async function dbDeleteSubscription(id){
+  if(!sb) return;
+  const { error } = await sb.from('family_subscriptions').delete().eq('id', id);
+  if(error){ showToast('Não consegui excluir a assinatura: ' + describeError(error)); console.error(error); }
+}
+
+function daysInMonth(d){ return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate(); }
+function pad2(n){ return String(n).padStart(2,'0'); }
+
+// Gera os lançamentos que estão faltando para cada assinatura ativa, do mês de início até o mês atual.
+async function generateDueSubscriptionTransactions(){
+  if(!state.subscriptions.length) return;
+  const today = new Date(); today.setDate(1);
+  const toInsert = [];
+  for(const sub of state.subscriptions){
+    if(!sub.ativa) continue;
+    const existingMonths = new Set(
+      state.transactions.filter(t=>t.subscriptionId === sub.id).map(t=>t.date.slice(0,7))
+    );
+    const [iy, im] = sub.inicio.split('-').map(Number);
+    let cursor = new Date(iy, im-1, 1);
+    while(cursor <= today){
+      const ym = cursor.getFullYear()+'-'+pad2(cursor.getMonth()+1);
+      if(!existingMonths.has(ym)){
+        const dia = Math.min(sub.diaCobranca, daysInMonth(cursor));
+        toInsert.push({
+          tipo:'despesa', data: `${ym}-${pad2(dia)}`, valor: sub.valor, categoria: sub.categoria,
+          descricao: sub.nome, membro: sub.membro, forma_pagamento:'Crédito', subscricao_id: sub.id
+        });
+      }
+      cursor.setMonth(cursor.getMonth()+1);
+    }
+  }
+  if(toInsert.length){
+    const inserted = await dbInsertTransactions(toInsert);
+    if(inserted.length){
+      state.transactions.push(...inserted);
+      state.transactions.sort((a,b)=> b.date.localeCompare(a.date));
+    }
+  }
+}
 function exportBackup(){
   const payload = { transactions: state.transactions, goals: state.goals, budgets: state.budgets, exportedAt: new Date().toISOString() };
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
@@ -694,6 +786,72 @@ document.querySelectorAll('input[name=txType]').forEach(r=>{
 });
 populateCategorySelect(document.getElementById('txCategory'), 'receita');
 document.getElementById('txDate').valueAsDate = new Date();
+populateCategorySelect(document.getElementById('subCategory'), 'despesa');
+document.getElementById('subCategory').value = 'Assinaturas';
+
+function renderSubs(){
+  const list = document.getElementById('subsList');
+  if(!state.subscriptions.length){
+    list.innerHTML = '<p class="sub-empty">Nenhuma assinatura cadastrada ainda.</p>';
+    return;
+  }
+  list.innerHTML = state.subscriptions.map(s=>`
+    <div class="sub-row ${s.ativa ? '' : 'paused'}">
+      <div class="info">
+        <strong>${s.nome}</strong>
+        <span>${s.categoria} · ${fmtBRL(s.valor)}/mês · dia ${s.diaCobranca} · ${s.membro}${s.ativa ? '' : ' · pausada'}</span>
+      </div>
+      <div class="actions">
+        <button class="btn ${s.ativa ? 'ghost' : ''}" data-toggle="${s.id}" data-active="${s.ativa}">${s.ativa ? 'Cancelar' : 'Reativar'}</button>
+        <button class="row-del" data-delsub="${s.id}" title="Excluir cadastro">✕</button>
+      </div>
+    </div>`).join('');
+
+  list.querySelectorAll('[data-toggle]').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      const isActive = b.dataset.active === 'true';
+      await dbSetSubscriptionActive(b.dataset.toggle, !isActive);
+      const sub = state.subscriptions.find(s=>s.id===b.dataset.toggle);
+      if(sub) sub.ativa = !isActive;
+      renderSubs();
+      showToast(isActive ? 'Assinatura cancelada.' : 'Assinatura reativada.');
+    });
+  });
+  list.querySelectorAll('[data-delsub]').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      const escolha = await showChoice('Excluir assinatura', 'Isso remove o cadastro da assinatura. Os lançamentos já feitos por ela continuam no histórico. Continuar?',
+        [{label:'Cancelar', value:'cancel', variant:'ghost'}, {label:'Excluir', value:'ok', variant:'danger'}]);
+      if(escolha !== 'ok') return;
+      await dbDeleteSubscription(b.dataset.delsub);
+      state.subscriptions = state.subscriptions.filter(s=>s.id!==b.dataset.delsub);
+      renderSubs();
+      showToast('Assinatura excluída.');
+    });
+  });
+}
+
+document.getElementById('addSubBtn').addEventListener('click', async ()=>{
+  const nome = document.getElementById('subName').value.trim();
+  const valor = parseFloat(document.getElementById('subValue').value);
+  const categoria = document.getElementById('subCategory').value;
+  const dia = Math.min(28, Math.max(1, parseInt(document.getElementById('subDay').value) || 1));
+  const membro = document.getElementById('subMember').value;
+  if(!nome || !valor || valor<=0){ showToast('Informe o nome do serviço e um valor válido.'); return; }
+
+  const btn = document.getElementById('addSubBtn');
+  btn.textContent = 'Salvando...'; btn.style.opacity='.7';
+  const sub = await dbInsertSubscription(nome, categoria, valor, dia, membro);
+  btn.textContent = '+ Nova assinatura'; btn.style.opacity='1';
+  if(sub){
+    state.subscriptions.push(sub);
+    await generateDueSubscriptionTransactions();
+    document.getElementById('subName').value=''; document.getElementById('subValue').value='';
+    document.getElementById('subDay').value = 1;
+    renderSubs();
+    populateFilters(); renderTxTable(); renderResumo(); renderOrcamento();
+    showToast(`Assinatura criada — ${fmtBRL(valor)}/mês lançados automaticamente.`);
+  }
+});
 
 function toggleInstallmentsVisibility(){
   const type = document.querySelector('input[name=txType]:checked').value;
@@ -813,10 +971,11 @@ function renderTxTable(){
     const [y,m,d] = t.date.split('-');
     const payLabel = t.payment ? `${PAYMENT_ICON[t.payment]||''} ${t.payment}` : '<span class="muted">—</span>';
     const parcelaTag = t.installments ? ` <span class="pill" style="background:var(--mustard-soft); color:#7A5C10;">${t.installments.cur}/${t.installments.total}</span>` : '';
+    const subTag = t.subscriptionId ? ` <span class="pill" style="background:var(--sage-soft); color:var(--teal-deep);">🔁 assinatura</span>` : '';
     return `<tr>
       <td>${d}/${m}</td>
       <td><span class="pill">${t.category}</span></td>
-      <td>${t.desc || '<span class="muted">—</span>'}${parcelaTag}</td>
+      <td>${t.desc || '<span class="muted">—</span>'}${parcelaTag}${subTag}</td>
       <td>${payLabel}</td>
       <td>${t.member}</td>
       <td class="amt ${t.type}">${t.type==='despesa'?'-':'+'} ${fmtBRL(t.amount)}</td>
@@ -1177,12 +1336,16 @@ document.getElementById('importFile').addEventListener('change', (e)=>{
 (async function init(){
   showToast('Carregando dados...');
   await loadState();
+  await generateDueSubscriptionTransactions();
   populateFilters();
   renderTxTable();
   updateMonthLabels();
   renderResumo();
+  renderSubs();
   document.getElementById('memberOptA').textContent = 'Você';
   document.getElementById('memberOptB').textContent = 'Parceiro(a)';
+  document.getElementById('subMemberOptA').textContent = 'Você';
+  document.getElementById('subMemberOptB').textContent = 'Parceiro(a)';
   toggleInstallmentsVisibility();
   if(dbReady) showToast('Dados carregados do Supabase.');
 })();
