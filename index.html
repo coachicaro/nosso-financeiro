@@ -506,6 +506,40 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="editModal">
+  <div class="modal" style="width:380px;">
+    <h3 class="serif">Editar lançamento</h3>
+    <p class="muted" id="editContext" style="margin-top:-8px; margin-bottom:14px;"></p>
+    <div class="field type-toggle">
+      <label class="receita"><input type="radio" name="editType" value="receita"><span>Receita</span></label>
+      <label class="despesa"><input type="radio" name="editType" value="despesa"><span>Despesa</span></label>
+    </div>
+    <div class="form-row">
+      <div class="field"><label for="editDate">Data</label><input type="date" id="editDate"></div>
+      <div class="field"><label for="editAmount">Valor (R$)</label><input type="number" id="editAmount" step="0.01" min="0"></div>
+    </div>
+    <div class="field"><label for="editCategory">Categoria</label><select id="editCategory"></select></div>
+    <div class="field"><label for="editDesc">Descrição</label><input type="text" id="editDesc"></div>
+    <div class="form-row">
+      <div class="field"><label for="editPayment">Forma de pagamento</label>
+        <select id="editPayment">
+          <option value="Dinheiro">Dinheiro</option>
+          <option value="Pix">Pix</option>
+          <option value="Débito">Débito</option>
+          <option value="Crédito">Cartão de crédito</option>
+        </select>
+      </div>
+      <div class="field"><label for="editMember">Quem</label>
+        <select id="editMember"><option>Casal</option><option id="editMemberOptA">Você</option><option id="editMemberOptB">Parceiro(a)</option></select>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="editCancel">Cancelar</button>
+      <button class="btn" id="editSave">Salvar alterações</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -629,6 +663,12 @@ async function dbDeleteGroup(groupId){
   const { error } = await sb.from('family_transactions').delete().eq('grupo_id', groupId);
   if(error){ showToast('Não consegui apagar as parcelas: ' + describeError(error)); console.error(error); return false; }
   return true;
+}
+async function dbUpdateTransaction(id, fields){
+  if(!sb){ showToast('Sem conexão com o Supabase.'); return null; }
+  const { data, error } = await sb.from('family_transactions').update(fields).eq('id', id).select().single();
+  if(error){ showToast('Não consegui salvar as alterações: ' + describeError(error)); console.error(error); return null; }
+  return rowToTx(data);
 }
 
 /* -------- orçamento -------- */
@@ -947,6 +987,58 @@ function populateFilters(){
   fc.innerHTML = '<option value="">Todas as categorias</option>' + allCats.map(c=>`<option value="${c}">${c}</option>`).join('');
   if(allCats.includes(curC)) fc.value = curC;
 }
+/* -------- editar lançamento -------- */
+let editTargetId = null;
+function openEditModal(id){
+  const tx = state.transactions.find(t=>t.id === id);
+  if(!tx) return;
+  editTargetId = id;
+  document.querySelector(`input[name=editType][value="${tx.type}"]`).checked = true;
+  populateCategorySelect(document.getElementById('editCategory'), tx.type);
+  document.getElementById('editCategory').value = tx.category;
+  document.getElementById('editDate').value = tx.date;
+  document.getElementById('editAmount').value = tx.amount;
+  document.getElementById('editDesc').value = tx.desc || '';
+  document.getElementById('editPayment').value = tx.payment || 'Dinheiro';
+  document.getElementById('editMember').value = tx.member || 'Casal';
+
+  let ctx = '';
+  if(tx.installments) ctx = `Parcela ${tx.installments.cur}/${tx.installments.total} — editar aqui altera só esta parcela.`;
+  if(tx.subscriptionId) ctx = 'Gerado por uma assinatura — editar aqui altera só este mês.';
+  document.getElementById('editContext').textContent = ctx;
+
+  openModal('editModal');
+}
+document.querySelectorAll('input[name=editType]').forEach(r=>{
+  r.addEventListener('change', ()=> populateCategorySelect(document.getElementById('editCategory'), r.value));
+});
+document.getElementById('editCancel').addEventListener('click', ()=>closeModal('editModal'));
+document.getElementById('editSave').addEventListener('click', async ()=>{
+  const type = document.querySelector('input[name=editType]:checked').value;
+  const date = document.getElementById('editDate').value;
+  const amount = parseFloat(document.getElementById('editAmount').value);
+  const category = document.getElementById('editCategory').value;
+  const desc = document.getElementById('editDesc').value.trim();
+  const payment = document.getElementById('editPayment').value;
+  const member = document.getElementById('editMember').value;
+  if(!date || !amount || amount<=0){ showToast('Preencha data e um valor válido.'); return; }
+
+  const btn = document.getElementById('editSave');
+  btn.textContent = 'Salvando...'; btn.style.opacity='.7';
+  const updated = await dbUpdateTransaction(editTargetId, {
+    tipo:type, data:date, valor:amount, categoria:category, descricao:desc, forma_pagamento:payment, membro:member
+  });
+  btn.textContent = 'Salvar alterações'; btn.style.opacity='1';
+  if(updated){
+    const idx = state.transactions.findIndex(t=>t.id === editTargetId);
+    if(idx > -1) state.transactions[idx] = updated;
+    state.transactions.sort((a,b)=> b.date.localeCompare(a.date));
+    closeModal('editModal');
+    populateFilters(); renderTxTable(); renderResumo(); renderOrcamento();
+    showToast('Lançamento atualizado.');
+  }
+});
+
 ['filterMonth','filterType','filterCategory','filterPayment'].forEach(id=>{
   document.getElementById(id).addEventListener('change', renderTxTable);
 });
@@ -979,10 +1071,16 @@ function renderTxTable(){
       <td>${payLabel}</td>
       <td>${t.member}</td>
       <td class="amt ${t.type}">${t.type==='despesa'?'-':'+'} ${fmtBRL(t.amount)}</td>
-      <td><button class="row-del" data-id="${t.id}" title="Remover">✕</button></td>
+      <td style="white-space:nowrap;">
+        <button class="row-del" data-edit="${t.id}" title="Editar" style="margin-right:4px;">✎</button>
+        <button class="row-del" data-id="${t.id}" title="Remover">✕</button>
+      </td>
     </tr>`;
   }).join('');
-  body.querySelectorAll('.row-del').forEach(b=>{
+  body.querySelectorAll('[data-edit]').forEach(b=>{
+    b.addEventListener('click', ()=> openEditModal(b.dataset.edit));
+  });
+  body.querySelectorAll('.row-del[data-id]').forEach(b=>{
     b.addEventListener('click', async ()=>{
       const tx = state.transactions.find(t=>t.id === b.dataset.id);
       if(!tx) return;
